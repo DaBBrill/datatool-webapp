@@ -24,8 +24,11 @@ import streamlit as st
 import psycopg2
 import pandas as pd
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from urllib.parse import urlparse
+from datetime import datetime
+from rapidfuzz import fuzz, process
+from streamlit_searchbox import st_searchbox
 
 
 # Page configuration
@@ -214,6 +217,286 @@ def get_vendor_inventory_analysis(_conn, vendor_name: str) -> Optional[pd.DataFr
         return None
 
 
+@st.cache_data(ttl=60)  # Cache for 1 minute
+def get_vendor_metadata_by_internal_id(_conn, internal_id: str) -> Optional[Dict]:
+    """
+    Fetch vendor metadata from vendor_metadata table by internal_id.
+    
+    Args:
+        _conn: Database connection (underscore prefix prevents hashing)
+        internal_id: The internal_id to lookup
+    
+    Returns:
+        Dict with vendor metadata fields, or None if not found
+    """
+    try:
+        cursor = _conn.cursor()
+        query = """
+            SELECT
+                internal_id,
+                name,
+                sales_rep,
+                billing_address_1,
+                billing_address_2,
+                billing_city,
+                billing_state_province,
+                billing_zip,
+                date_of_last_sale,
+                inactive,
+                dealer_terms
+            FROM vendor_metadata
+            WHERE internal_id = %s;
+        """
+        cursor.execute(query, (internal_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        
+        if row:
+            return {
+                'internal_id': row[0],
+                'name': row[1],
+                'sales_rep': row[2],
+                'billing_address_1': row[3],
+                'billing_address_2': row[4],
+                'billing_city': row[5],
+                'billing_state_province': row[6],
+                'billing_zip': row[7],
+                'date_of_last_sale': row[8],
+                'inactive': row[9],
+                'dealer_terms': row[10]
+            }
+        return None
+    except Exception as e:
+        st.error(f"Failed to fetch vendor metadata: {str(e)}")
+        return None
+
+
+@st.cache_data(ttl=60)  # Cache for 1 minute
+def get_vendor_internal_id(_conn, vendor_name: str) -> Optional[str]:
+    """
+    Check if a vendor name has an internal_id mapping in transactions table.
+    Uses normalized vendor name matching. If multiple internal_ids exist,
+    returns the most common one.
+    
+    Args:
+        _conn: Database connection (underscore prefix prevents hashing)
+        vendor_name: Vendor name to check (title case)
+    
+    Returns:
+        internal_id if found, None otherwise
+    """
+    try:
+        cursor = _conn.cursor()
+        query = """
+            SELECT internal_id, COUNT(*) as count
+            FROM transactions
+            WHERE INITCAP(LOWER(vendor)) = INITCAP(LOWER(%s))
+              AND internal_id IS NOT NULL
+            GROUP BY internal_id
+            ORDER BY count DESC
+            LIMIT 1;
+        """
+        cursor.execute(query, (vendor_name,))
+        row = cursor.fetchone()
+        cursor.close()
+        
+        if row:
+            return row[0]
+        return None
+    except Exception as e:
+        st.error(f"Failed to check vendor mapping: {str(e)}")
+        return None
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_all_vendor_metadata_names(_conn) -> List[Tuple[str, str]]:
+    """
+    Fetch all vendor names and internal_ids from vendor_metadata table.
+    
+    Args:
+        _conn: Database connection (underscore prefix prevents hashing)
+    
+    Returns:
+        List of tuples (internal_id, name)
+    """
+    try:
+        cursor = _conn.cursor()
+        query = """
+            SELECT internal_id, name
+            FROM vendor_metadata
+            ORDER BY name;
+        """
+        cursor.execute(query)
+        results = cursor.fetchall()
+        cursor.close()
+        return results
+    except Exception as e:
+        st.error(f"Failed to fetch vendor metadata names: {str(e)}")
+        return []
+
+
+def update_vendor_mapping(conn, vendor_name: str, internal_id: str) -> int:
+    """
+    Update all transactions with matching vendor name to set internal_id.
+    Uses normalized vendor name matching.
+    
+    Args:
+        conn: Database connection
+        vendor_name: Vendor name to update (title case)
+        internal_id: internal_id to assign
+    
+    Returns:
+        Number of rows affected
+    """
+    try:
+        cursor = conn.cursor()
+        
+        # Start transaction
+        conn.autocommit = False
+        
+        query = """
+            UPDATE transactions
+            SET internal_id = %s
+            WHERE INITCAP(LOWER(vendor)) = INITCAP(LOWER(%s))
+              AND (internal_id IS NULL OR internal_id != %s);
+        """
+        cursor.execute(query, (internal_id, vendor_name, internal_id))
+        affected_rows = cursor.rowcount
+        
+        # Commit transaction
+        conn.commit()
+        cursor.close()
+        
+        # Clear relevant caches
+        get_vendor_internal_id.clear()
+        
+        return affected_rows
+        
+    except Exception as e:
+        # Rollback on error
+        conn.rollback()
+        st.error(f"Failed to update vendor mapping: {str(e)}")
+        raise
+    finally:
+        conn.autocommit = True
+
+
+def undo_vendor_mapping(conn, vendor_name: str, internal_id: str) -> int:
+    """
+    Revert transactions back to NULL internal_id for specific vendor/internal_id pair.
+    
+    Args:
+        conn: Database connection
+        vendor_name: Vendor name to revert (title case)
+        internal_id: internal_id to remove
+    
+    Returns:
+        Number of rows affected
+    """
+    try:
+        cursor = conn.cursor()
+        
+        # Start transaction
+        conn.autocommit = False
+        
+        query = """
+            UPDATE transactions
+            SET internal_id = NULL
+            WHERE INITCAP(LOWER(vendor)) = INITCAP(LOWER(%s))
+              AND internal_id = %s;
+        """
+        cursor.execute(query, (vendor_name, internal_id))
+        affected_rows = cursor.rowcount
+        
+        # Commit transaction
+        conn.commit()
+        cursor.close()
+        
+        # Clear relevant caches
+        get_vendor_internal_id.clear()
+        
+        return affected_rows
+        
+    except Exception as e:
+        # Rollback on error
+        conn.rollback()
+        st.error(f"Failed to undo vendor mapping: {str(e)}")
+        raise
+    finally:
+        conn.autocommit = True
+
+
+def get_fuzzy_match_candidates(
+    vendor_name: str,
+    all_metadata_names: List[Tuple[str, str]],
+    top_n: int = 50
+) -> List[Tuple[str, str, float]]:
+    """
+    Generate fuzzy match candidates using multiple matching strategies.
+    
+    Args:
+        vendor_name: Vendor name to match
+        all_metadata_names: List of (internal_id, name) tuples from vendor_metadata
+        top_n: Number of top candidates to return
+    
+    Returns:
+        List of (internal_id, name, score) tuples sorted by score descending
+    """
+    if not all_metadata_names or not vendor_name:
+        return []
+    
+    # Extract just the names for fuzzy matching
+    names_only = [name for _, name in all_metadata_names]
+    name_to_id = {name: internal_id for internal_id, name in all_metadata_names}
+    
+    candidates_dict = {}  # {name: best_score}
+    
+    # Strategy 1: Standard ratio - good for overall similarity
+    matches_ratio = process.extract(
+        vendor_name,
+        names_only,
+        scorer=fuzz.ratio,
+        limit=top_n
+    )
+    for match, score, _ in matches_ratio:
+        candidates_dict[match] = max(candidates_dict.get(match, 0), score)
+    
+    # Strategy 2: Partial ratio - catches substrings (e.g., 'alberts' in 'alberts farmstead')
+    matches_partial = process.extract(
+        vendor_name,
+        names_only,
+        scorer=fuzz.partial_ratio,
+        limit=top_n
+    )
+    for match, score, _ in matches_partial:
+        # Boost score slightly for partial matches
+        candidates_dict[match] = max(candidates_dict.get(match, 0), score * 1.1)
+    
+    # Strategy 3: Token set ratio - handles word order differences and subsets
+    matches_token_set = process.extract(
+        vendor_name,
+        names_only,
+        scorer=fuzz.token_set_ratio,
+        limit=top_n
+    )
+    for match, score, _ in matches_token_set:
+        candidates_dict[match] = max(candidates_dict.get(match, 0), score)
+    
+    # Strategy 4: Token sort ratio - handles reordering
+    matches_token_sort = process.extract(
+        vendor_name,
+        names_only,
+        scorer=fuzz.token_sort_ratio,
+        limit=top_n
+    )
+    for match, score, _ in matches_token_sort:
+        candidates_dict[match] = max(candidates_dict.get(match, 0), score)
+    
+    # Sort by best score and return top candidates with internal_id
+    sorted_candidates = sorted(candidates_dict.items(), key=lambda x: x[1], reverse=True)
+    return [(name_to_id[name], name, score) for name, score in sorted_candidates[:top_n]]
+
+
 def format_currency(value):
     """Format a number as currency."""
     if pd.isna(value):
@@ -228,8 +511,222 @@ def format_integer(value):
     return f"{int(value):,}"
 
 
+def display_vendor_metadata(metadata: Dict):
+    """
+    Display vendor metadata information in a formatted container.
+    
+    Args:
+        metadata: Dictionary containing vendor metadata fields
+    """
+    st.markdown("### 📋 Vendor Information")
+    
+    # Create two columns for better layout
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Sales Representative:**")
+        st.text(metadata.get('sales_rep') or 'Not Available')
+        
+        st.markdown("**Billing Address:**")
+        address_lines = []
+        if metadata.get('billing_address_1'):
+            address_lines.append(metadata['billing_address_1'])
+        if metadata.get('billing_address_2'):
+            address_lines.append(metadata['billing_address_2'])
+        
+        city_state_zip = []
+        if metadata.get('billing_city'):
+            city_state_zip.append(metadata['billing_city'])
+        if metadata.get('billing_state_province'):
+            city_state_zip.append(metadata['billing_state_province'])
+        if metadata.get('billing_zip'):
+            city_state_zip.append(metadata['billing_zip'])
+        
+        if city_state_zip:
+            address_lines.append(', '.join(city_state_zip))
+        
+        if address_lines:
+            for line in address_lines:
+                st.text(line)
+        else:
+            st.text('Not Available')
+    
+    with col2:
+        st.markdown("**Date of Last Sale:**")
+        if metadata.get('date_of_last_sale'):
+            st.text(metadata['date_of_last_sale'].strftime('%Y-%m-%d'))
+        else:
+            st.text('Not Available')
+        
+        st.markdown("**Status:**")
+        inactive = metadata.get('inactive', '').lower()
+        if inactive in ['yes', 'y', 'true', '1']:
+            st.markdown("🔴 **Inactive**")
+        else:
+            st.markdown("🟢 **Active**")
+        
+        st.markdown("**Dealer Terms:**")
+        st.text(metadata.get('dealer_terms') or 'Not Available')
+    
+    st.markdown("---")
+
+
+def search_vendor_metadata(searchterm: str, all_metadata_names: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """
+    Search function for streamlit-searchbox.
+    Returns matching vendor names based on search term.
+    
+    Args:
+        searchterm: User's search input
+        all_metadata_names: List of (internal_id, name) tuples
+    
+    Returns:
+        List of (internal_id, name) tuples matching the search term
+    """
+    if not searchterm:
+        return []
+    
+    # Filter names that contain the search term (case-insensitive)
+    matches = [
+        (internal_id, name)
+        for internal_id, name in all_metadata_names
+        if searchterm.lower() in name.lower()
+    ]
+    
+    # Return top 20 matches
+    return matches[:20]
+
+
+def display_vendor_mapping_interface(conn, vendor_name: str, all_metadata_names: List[Tuple[str, str]]):
+    """
+    Display manual vendor mapping interface with fuzzy matching and searchbox.
+    
+    Args:
+        conn: Database connection
+        vendor_name: The vendor name to map
+        all_metadata_names: List of (internal_id, name) tuples from vendor_metadata
+    """
+    st.markdown("### ⚠️ Vendor Mapping Required")
+    st.warning(
+        f"The vendor **{vendor_name}** is not currently mapped to vendor metadata. "
+        "Please select the correct vendor from the list below to establish the mapping."
+    )
+    
+    # Get fuzzy match candidates
+    with st.spinner("Finding similar vendors..."):
+        candidates = get_fuzzy_match_candidates(vendor_name, all_metadata_names, top_n=50)
+    
+    if candidates:
+        st.info(f"Found {len(candidates)} potential matches based on similarity.")
+        
+        # Create options for searchbox (show top candidates with scores)
+        candidate_options = [
+            (internal_id, f"{name} (similarity: {score:.0f}%)")
+            for internal_id, name, score in candidates[:10]
+        ]
+        
+        # Add searchbox for manual search
+        st.markdown("**Search and select the correct vendor:**")
+        st.caption("Type to search all vendors, or select from the suggested matches below.")
+        
+        # Create a selectbox with fuzzy candidates
+        selected_option = st.selectbox(
+            "Select vendor metadata to map:",
+            options=[""] + [f"{internal_id}|{name}" for internal_id, name, _ in candidates],
+            format_func=lambda x: x.split("|")[1] if "|" in x else "-- Select a vendor --",
+            key=f"vendor_mapping_select_{vendor_name}"
+        )
+        
+        if selected_option:
+            selected_internal_id, selected_name = selected_option.split("|", 1)
+            
+            # Show preview of mapping
+            st.info(f"**Mapping Preview:** '{vendor_name}' → '{selected_name}'")
+            
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                if st.button("✅ Confirm Mapping", type="primary", key=f"confirm_map_{vendor_name}"):
+                    try:
+                        # Perform the mapping
+                        affected_rows = update_vendor_mapping(conn, vendor_name, selected_internal_id)
+                        
+                        # Add to session state mapping history
+                        if 'mapping_history' not in st.session_state:
+                            st.session_state.mapping_history = []
+                        
+                        st.session_state.mapping_history.append({
+                            'vendor_name': vendor_name,
+                            'internal_id': selected_internal_id,
+                            'metadata_name': selected_name,
+                            'timestamp': datetime.now(),
+                            'affected_rows': affected_rows
+                        })
+                        
+                        st.success(f"✅ Successfully mapped {affected_rows} transaction(s) to '{selected_name}'!")
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Failed to create mapping: {str(e)}")
+    else:
+        st.error("No vendor metadata candidates found. Please check the vendor_metadata table.")
+    
+    st.markdown("---")
+
+
+def display_undo_panel(conn):
+    """
+    Display panel showing recent mappings with undo buttons.
+    
+    Args:
+        conn: Database connection
+    """
+    if 'mapping_history' not in st.session_state or not st.session_state.mapping_history:
+        return
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔄 Recent Mappings")
+    st.sidebar.caption("Mappings made in this session can be undone:")
+    
+    # Display mappings in reverse order (most recent first)
+    for idx, mapping in enumerate(reversed(st.session_state.mapping_history)):
+        with st.sidebar.expander(
+            f"**{mapping['vendor_name']}** → {mapping['metadata_name'][:20]}...",
+            expanded=False
+        ):
+            st.caption(f"Time: {mapping['timestamp'].strftime('%H:%M:%S')}")
+            st.caption(f"Affected rows: {mapping['affected_rows']}")
+            
+            # Undo button
+            if st.button(
+                "🔙 Undo This Mapping",
+                key=f"undo_{idx}_{mapping['vendor_name']}_{mapping['timestamp']}",
+                help=f"Revert {mapping['affected_rows']} transaction(s) back to unmapped state"
+            ):
+                try:
+                    # Perform undo
+                    reverted_rows = undo_vendor_mapping(
+                        conn,
+                        mapping['vendor_name'],
+                        mapping['internal_id']
+                    )
+                    
+                    # Remove from history
+                    actual_index = len(st.session_state.mapping_history) - 1 - idx
+                    st.session_state.mapping_history.pop(actual_index)
+                    
+                    st.sidebar.success(f"✅ Undone! Reverted {reverted_rows} transaction(s).")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.sidebar.error(f"Failed to undo mapping: {str(e)}")
+
+
 def main():
     """Main application logic."""
+    
+    # Initialize session state
+    if 'mapping_history' not in st.session_state:
+        st.session_state.mapping_history = []
     
     # Header
     st.title("📊 Vendor Inventory Analysis")
@@ -246,6 +743,9 @@ def main():
     except Exception:
         st.error("❌ Unable to connect to database. Please check your configuration.")
         st.stop()
+    
+    # Display undo panel in sidebar if there are any mappings
+    display_undo_panel(conn)
     
     # Vendor filtering checkbox
     st.subheader("Vendor Filters")
@@ -277,6 +777,25 @@ def main():
     # Display inventory analysis for selected vendor
     if selected_vendor:
         st.markdown("---")
+        
+        # Check if vendor has internal_id mapping
+        internal_id = get_vendor_internal_id(conn, selected_vendor)
+        
+        if internal_id:
+            # Vendor is mapped - display metadata
+            metadata = get_vendor_metadata_by_internal_id(conn, internal_id)
+            if metadata:
+                display_vendor_metadata(metadata)
+            else:
+                st.warning(f"Vendor is mapped to internal_id '{internal_id}' but metadata not found in vendor_metadata table.")
+        else:
+            # Vendor is not mapped - show mapping interface
+            all_metadata_names = get_all_vendor_metadata_names(conn)
+            if all_metadata_names:
+                display_vendor_mapping_interface(conn, selected_vendor, all_metadata_names)
+            else:
+                st.error("No vendor metadata available in the database. Please populate the vendor_metadata table.")
+        
         st.subheader(f"Inventory Analysis for: `{selected_vendor}`")
         
         with st.spinner(f"Analyzing inventory for {selected_vendor}..."):
