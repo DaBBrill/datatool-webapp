@@ -2,20 +2,24 @@
 # This file contains configuration settings for Streamlit deployment
 
 [theme]
-# Primary color for interactive elements
-primaryColor = "#1f77b4"
+# Dark Theme Configuration
+# Primary color for interactive elements (bright blue for dark mode)
+primaryColor = "#4A9EFF"
 
-# Background color for the main content area
-backgroundColor = "#FFFFFF"
+# Background color for the main content area (dark gray)
+backgroundColor = "#0E1117"
 
-# Background color for sidebar and other secondary elements
-secondaryBackgroundColor = "#F0F2F6"
+# Background color for sidebar and other secondary elements (slightly lighter dark gray)
+secondaryBackgroundColor = "#262730"
 
-# Color used for text
-textColor = "#262730"
+# Color used for text (light gray/white for readability on dark background)
+textColor = "#FAFAFA"
 
 # Font family for text
 font = "sans serif"
+
+# Note: Users can also manually switch themes via the hamburger menu:
+# Settings → Theme → Choose between "Light", "Dark", or "Use system setting"
 
 [server]
 # Enable or disable CORS protection
