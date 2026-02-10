@@ -85,7 +85,9 @@ def get_database_connection():
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def get_vendors(_conn, only_2025: bool = True) -> List[str]:
+def get_vendors(_conn, only_2025: bool = True, sales_reps: List[str] = None,
+                states: List[str] = None, dealer_terms: List[str] = None,
+                statuses: List[str] = None) -> List[str]:
     """
     Retrieve list of unique vendor names from transactions table.
     Normalizes vendor names to title case for consistent display.
@@ -93,6 +95,10 @@ def get_vendors(_conn, only_2025: bool = True) -> List[str]:
     Args:
         _conn: Database connection (underscore prefix prevents hashing)
         only_2025: If True, only show vendors with 2025 sales (default: True)
+        sales_reps: List of sales representatives to filter by (optional)
+        states: List of states (billing address) to filter by (optional)
+        dealer_terms: List of dealer terms to filter by (optional)
+        statuses: List of statuses to filter by (optional, 'Active' or 'Inactive')
     
     Returns:
         List[str]: Sorted list of unique normalized vendor names
@@ -100,24 +106,66 @@ def get_vendors(_conn, only_2025: bool = True) -> List[str]:
     try:
         cursor = _conn.cursor()
         
-        # Conditionally add WHERE clause for 2025 filtering
+        # Build WHERE clause conditions
+        where_conditions = ["t.vendor IS NOT NULL"]
+        params = []
+        
+        # Add 2025 filter
         if only_2025:
-            query = """
-                SELECT DISTINCT INITCAP(LOWER(vendor)) AS normalized_vendor
-                FROM transactions
-                WHERE vendor IS NOT NULL
-                  AND EXTRACT(YEAR FROM invoice_date) = 2025
-                ORDER BY normalized_vendor;
-            """
+            where_conditions.append("EXTRACT(YEAR FROM t.invoice_date) = 2025")
+        
+        # Determine if we need to join with vendor_metadata
+        needs_metadata_join = (sales_reps or states or dealer_terms or statuses)
+        
+        if needs_metadata_join:
+            # Build query with vendor_metadata join
+            query_parts = [
+                "SELECT DISTINCT INITCAP(LOWER(t.vendor)) AS normalized_vendor",
+                "FROM transactions t",
+                "INNER JOIN vendor_metadata vm ON t.internal_id = vm.internal_id",
+                "WHERE " + " AND ".join(where_conditions)
+            ]
+            
+            # Add filter conditions
+            if sales_reps:
+                placeholders = ','.join(['%s'] * len(sales_reps))
+                query_parts.append(f"AND vm.sales_rep IN ({placeholders})")
+                params.extend(sales_reps)
+            
+            if states:
+                placeholders = ','.join(['%s'] * len(states))
+                query_parts.append(f"AND vm.billing_state_province IN ({placeholders})")
+                params.extend(states)
+            
+            if dealer_terms:
+                placeholders = ','.join(['%s'] * len(dealer_terms))
+                query_parts.append(f"AND vm.dealer_terms IN ({placeholders})")
+                params.extend(dealer_terms)
+            
+            if statuses:
+                # Convert status labels to database values
+                status_conditions = []
+                for status in statuses:
+                    if status == "Active":
+                        status_conditions.append("(vm.inactive IS NULL OR vm.inactive NOT IN ('yes', 'y', 'true', '1', 'Yes', 'Y', 'True', 'TRUE'))")
+                    elif status == "Inactive":
+                        status_conditions.append("(vm.inactive IN ('yes', 'y', 'true', '1', 'Yes', 'Y', 'True', 'TRUE'))")
+                
+                if status_conditions:
+                    query_parts.append(f"AND ({' OR '.join(status_conditions)})")
+            
+            query_parts.append("ORDER BY normalized_vendor;")
+            query = "\n".join(query_parts)
         else:
-            query = """
+            # Simple query without metadata join
+            query = f"""
                 SELECT DISTINCT INITCAP(LOWER(vendor)) AS normalized_vendor
-                FROM transactions
-                WHERE vendor IS NOT NULL
+                FROM transactions t
+                WHERE {' AND '.join(where_conditions)}
                 ORDER BY normalized_vendor;
             """
         
-        cursor.execute(query)
+        cursor.execute(query, params if params else None)
         vendors = [row[0] for row in cursor.fetchall()]
         cursor.close()
         return vendors
@@ -333,6 +381,66 @@ def get_all_vendor_metadata_names(_conn) -> List[Tuple[str, str]]:
     except Exception as e:
         st.error(f"Failed to fetch vendor metadata names: {str(e)}")
         return []
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_vendor_filter_options(_conn) -> Dict[str, List[str]]:
+    """
+    Retrieve unique values for vendor metadata filters.
+    
+    Args:
+        _conn: Database connection (underscore prefix prevents hashing)
+    
+    Returns:
+        Dict containing lists of unique values for each filter:
+        - sales_reps: List of unique sales representatives
+        - states: List of unique billing states
+        - dealer_terms: List of unique dealer terms
+    """
+    try:
+        cursor = _conn.cursor()
+        
+        # Get unique sales representatives
+        cursor.execute("""
+            SELECT DISTINCT sales_rep
+            FROM vendor_metadata
+            WHERE sales_rep IS NOT NULL AND sales_rep != ''
+            ORDER BY sales_rep;
+        """)
+        sales_reps = [row[0] for row in cursor.fetchall()]
+        
+        # Get unique states
+        cursor.execute("""
+            SELECT DISTINCT billing_state_province
+            FROM vendor_metadata
+            WHERE billing_state_province IS NOT NULL AND billing_state_province != ''
+            ORDER BY billing_state_province;
+        """)
+        states = [row[0] for row in cursor.fetchall()]
+        
+        # Get unique dealer terms
+        cursor.execute("""
+            SELECT DISTINCT dealer_terms
+            FROM vendor_metadata
+            WHERE dealer_terms IS NOT NULL AND dealer_terms != ''
+            ORDER BY dealer_terms;
+        """)
+        dealer_terms = [row[0] for row in cursor.fetchall()]
+        
+        cursor.close()
+        
+        return {
+            'sales_reps': sales_reps,
+            'states': states,
+            'dealer_terms': dealer_terms
+        }
+    except Exception as e:
+        st.error(f"Failed to retrieve filter options: {str(e)}")
+        return {
+            'sales_reps': [],
+            'states': [],
+            'dealer_terms': []
+        }
 
 
 def update_vendor_mapping(conn, vendor_name: str, internal_id: str) -> int:
@@ -747,17 +855,73 @@ def main():
     # Display undo panel in sidebar if there are any mappings
     display_undo_panel(conn)
     
-    # Vendor filtering checkbox
+    # Vendor filtering section
     st.subheader("Vendor Filters")
-    only_2025_vendors = st.checkbox(
-        "Only show vendors with 2025 sales",
-        value=True,
-        help="When checked, only shows vendors who have transactions in 2025"
-    )
     
-    # Get list of vendors
+    # Get filter options
+    with st.spinner("Loading filter options..."):
+        filter_options = get_vendor_filter_options(conn)
+    
+    # Create filter columns
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        only_2025_vendors = st.checkbox(
+            "Only show vendors with 2025 sales",
+            value=True,
+            help="When checked, only shows vendors who have transactions in 2025"
+        )
+    
+    with col2:
+        # Status filter
+        selected_statuses = st.multiselect(
+            "Status",
+            options=["Active", "Inactive"],
+            default=[],
+            help="Filter vendors by active/inactive status"
+        )
+    
+    # Additional filters in an expander for cleaner UI
+    with st.expander("🔍 Advanced Filters", expanded=False):
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        
+        with filter_col1:
+            # Sales Representative filter
+            selected_sales_reps = st.multiselect(
+                "Sales Representative",
+                options=filter_options['sales_reps'],
+                default=[],
+                help="Filter vendors by sales representative"
+            )
+        
+        with filter_col2:
+            # State filter
+            selected_states = st.multiselect(
+                "State (Billing Address)",
+                options=filter_options['states'],
+                default=[],
+                help="Filter vendors by billing state"
+            )
+        
+        with filter_col3:
+            # Dealer Terms filter
+            selected_dealer_terms = st.multiselect(
+                "Dealer Terms",
+                options=filter_options['dealer_terms'],
+                default=[],
+                help="Filter vendors by dealer terms"
+            )
+    
+    # Get list of vendors with filters applied
     with st.spinner("Loading vendor list..."):
-        vendors = get_vendors(conn, only_2025=only_2025_vendors)
+        vendors = get_vendors(
+            conn,
+            only_2025=only_2025_vendors,
+            sales_reps=selected_sales_reps if selected_sales_reps else None,
+            states=selected_states if selected_states else None,
+            dealer_terms=selected_dealer_terms if selected_dealer_terms else None,
+            statuses=selected_statuses if selected_statuses else None
+        )
     
     if not vendors:
         st.warning("No vendors found in the database.")
