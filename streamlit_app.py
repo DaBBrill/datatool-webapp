@@ -320,6 +320,39 @@ def get_vendor_metadata_by_internal_id(_conn, internal_id: str) -> Optional[Dict
 
 
 @st.cache_data(ttl=60)  # Cache for 1 minute
+def get_vendor_most_recent_transaction_date(_conn, internal_id: str) -> Optional[datetime]:
+    """
+    Get the most recent transaction date for a vendor by internal_id.
+    Used as fallback when date_of_last_sale is not available in vendor_metadata.
+    
+    Args:
+        _conn: Database connection (underscore prefix prevents hashing)
+        internal_id: The internal_id to lookup
+    
+    Returns:
+        datetime of most recent transaction, or None if no transactions found
+    """
+    try:
+        cursor = _conn.cursor()
+        query = """
+            SELECT MAX(invoice_date) as most_recent_date
+            FROM transactions
+            WHERE internal_id = %s
+              AND invoice_date IS NOT NULL;
+        """
+        cursor.execute(query, (internal_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        
+        if row and row[0]:
+            return row[0]
+        return None
+    except Exception as e:
+        st.error(f"Failed to fetch most recent transaction date: {str(e)}")
+        return None
+
+
+@st.cache_data(ttl=60)  # Cache for 1 minute
 def get_vendor_internal_id(_conn, vendor_name: str) -> Optional[str]:
     """
     Check if a vendor name has an internal_id mapping in transactions table.
@@ -619,12 +652,15 @@ def format_integer(value):
     return f"{int(value):,}"
 
 
-def display_vendor_metadata(metadata: Dict):
+def display_vendor_metadata(conn, metadata: Dict, internal_id: str):
     """
     Display vendor metadata information in a formatted container.
+    Uses fallback to most recent transaction date if date_of_last_sale is not available.
     
     Args:
+        conn: Database connection
         metadata: Dictionary containing vendor metadata fields
+        internal_id: The internal_id for fallback transaction date lookup
     """
     st.markdown("### 📋 Vendor Information")
     
@@ -661,10 +697,18 @@ def display_vendor_metadata(metadata: Dict):
     
     with col2:
         st.markdown("**Date of Last Sale:**")
-        if metadata.get('date_of_last_sale'):
-            st.text(metadata['date_of_last_sale'].strftime('%Y-%m-%d'))
+        date_of_last_sale = metadata.get('date_of_last_sale')
+        
+        if date_of_last_sale:
+            # Use date from vendor_metadata
+            st.text(date_of_last_sale.strftime('%Y-%m-%d'))
         else:
-            st.text('Not Available')
+            # Fallback: use most recent transaction date
+            most_recent_transaction = get_vendor_most_recent_transaction_date(conn, internal_id)
+            if most_recent_transaction:
+                st.text(f"{most_recent_transaction.strftime('%Y-%m-%d')} (from transactions)")
+            else:
+                st.text('Not Available')
         
         st.markdown("**Status:**")
         inactive = metadata.get('inactive', '').lower()
@@ -949,7 +993,7 @@ def main():
             # Vendor is mapped - display metadata
             metadata = get_vendor_metadata_by_internal_id(conn, internal_id)
             if metadata:
-                display_vendor_metadata(metadata)
+                display_vendor_metadata(conn, metadata, internal_id)
             else:
                 st.warning(f"Vendor is mapped to internal_id '{internal_id}' but metadata not found in vendor_metadata table.")
         else:
